@@ -18,8 +18,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INIT]  device={device}")
 
 # Parameters you may want to tweak 
-SEQ_SET    = [30, 60, 120, 180]               # heterogeneous windows
-HIDDEN_SET = [64,128, 256, 256]              # one per window (same length!)
+SEQ_SET    = [14, 30, 60, 120, 180]               # heterogeneous windows
+HIDDEN_SET = [512, 512, 512, 512, 512]              # one per window (same length!)
 EPOCHS     = 60                               # per LSTM
 SPLIT_DATE = datetime(2017, 8, 4)             # AoOR protocol
 CSV_FILE   = "wti_daily.csv"
@@ -132,10 +132,25 @@ def evaluate(name, pred_scaled):
               f"MSE {mean_squared_error(y_h,f_h):10.2f}  "
               f"SMAPE {smape(y_h,f_h):6.2f}%")
 
-print("\n=== Multi-horizon metrics (USD) ===")
-for nm, pr in zip([f"LSTM{h}" for h in HIDDEN_SET], base_preds):
-    evaluate(nm, pr)
-evaluate("STACK", stack_pred_scaled)
+def evaluate_by_horizon():
+    print("\n=== Multi-horizon metrics (USD) ===")
+    models = [f"LSTM{h}L{SEQ_SET[i]}" for i, h in enumerate(HIDDEN_SET)] + ["STACK"]
+    predictions = base_preds + [stack_pred_scaled]
+    
+    for h in horizons:
+        print(f"\n--- Horizon {h} days ---")
+        print("Model      & h &  MAE    &   MSE     &  SMAPE \\")
+        for name, pred_scaled in zip(models, predictions):
+            p_usd = scaler.inverse_transform(pred_scaled.reshape(-1,1)).squeeze()
+            y_h, f_h = truth_usd[h:], p_usd[:-h]
+            print(f"{name:<10} & h={h:2d} &"
+                  f"{mean_absolute_error(y_h,f_h):8.2f} &"
+                  f"{mean_squared_error(y_h,f_h):10.2f} &"
+                  f"{smape(y_h,f_h):6.2f}\% \\")
+
+# Replace original evaluation code with:
+evaluate_by_horizon()
+
 
 # Plots  – one per model + stack
 test_dates = df["Date"].iloc[split_idx: ].values   # aligns to y_test_max
