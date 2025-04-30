@@ -178,6 +178,10 @@ gcv = GridSearchCV(SVR(kernel="rbf"), param,
                    cv=TimeSeriesSplit(n_splits=5), scoring="neg_mean_absolute_error")
 gcv.fit(X_tr, y_tr.ravel())
 
+print("\n=== Best SVR Parameters ===")
+print(f"Best parameters: {gcv.best_params_}")
+print(f"Best score: {-gcv.best_score_:.4f} (MAE)\n")
+
 stack_pred_scaled = y_scaler.inverse_transform(
     gcv.best_estimator_.predict(x_scaler.transform(test_meta)).reshape(-1, 1)
 ).squeeze()
