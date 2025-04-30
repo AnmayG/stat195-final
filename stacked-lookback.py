@@ -4,7 +4,7 @@ import numpy  as np
 import pandas as pd
 import torch, torch.nn as nn
 from datetime               import datetime
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.preprocessing  import MinMaxScaler, StandardScaler
 from sklearn.svm            import SVR
 from sklearn.metrics        import mean_squared_error, mean_absolute_error
@@ -19,7 +19,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INIT]  device={device}")
 
 SEQ_SET    = [7, 14, 30, 60, 120, 180]
-HIDDEN_SET = [128, 128, 128, 128, 128, 128]
+HIDDEN_SET = [256, 256, 256, 256, 256, 256]
 EPOCHS     = 60
 SPLIT_DATE = datetime(2017, 8, 4)
 CSV_FILE   = "wti_daily.csv"
@@ -122,6 +122,8 @@ for j, (L, H) in enumerate(zip(SEQ_SET, HIDDEN_SET), 1):
     model = PriceLSTM(H)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params}")
+    print(f"Trainset size: {len(X_tr):,}  Testset size: {len(X_te):,}")
+    print(f"Model Capacity to Trainset Ratio: {total_params/len(X_tr):.2f}")
     net = fit_lstm(model, X_tr, y_tr, tag=f"L{L}h{H}")
     with torch.no_grad():
         train_meta[:, j-1] = net(torch.tensor(X_tr, dtype=torch.float32,
@@ -131,9 +133,31 @@ for j, (L, H) in enumerate(zip(SEQ_SET, HIDDEN_SET), 1):
         base_preds.append(test_meta[:, j-1].copy())
         
 # SVR stack trained on aligned TRAIN meta 
-svr = SVR(kernel="rbf", C=3, gamma="scale", epsilon=0.1)
-svr.fit(train_meta, y_train_max.ravel())
-stack_pred_scaled = svr.predict(test_meta)
+# svr = SVR(kernel="rbf", C=10, gamma="scale", epsilon=0.1)
+# svr.fit(train_meta, y_train_max.ravel())
+# stack_pred_scaled = svr.predict(test_meta)
+
+# scale to -1,1 for SVR
+x_scaler = StandardScaler().fit(train_meta)                # features
+y_scaler = StandardScaler().fit(y_train_max.reshape(-1,1)) # target
+X_tr = x_scaler.transform(train_meta)
+X_te = x_scaler.transform(test_meta)
+y_tr = y_scaler.transform(y_train_max.reshape(-1,1)).ravel()
+
+# svr = SVR(kernel="rbf", C=3, gamma="scale", epsilon=0.1)
+# svr.fit(X_tr, y_tr)
+# stack_pred_scaled = y_scaler.inverse_transform(
+#         svr.predict(X_te).reshape(-1,1)
+# ).squeeze()
+
+param = {"C":[0.3, 1, 3, 10], "gamma":[0.1, 0.5, 1.0], "epsilon":[0.01,0.05,0.1]}
+gcv   = GridSearchCV(SVR(kernel="rbf"), param,
+                     cv=TimeSeriesSplit(n_splits=5), scoring="neg_mean_absolute_error")
+gcv.fit(X_tr, y_tr.ravel())
+
+stack_pred_scaled = y_scaler.inverse_transform(
+        gcv.best_estimator_.predict(x_scaler.transform(test_meta)).reshape(-1,1)
+).squeeze()
 print("[STACK] SVR meta-learner trained.")
 
 # Multi-horizon metrics (1/5/22-day) 
@@ -250,25 +274,3 @@ for (L,H), (tr_pred, te_pred) in zip(zip(SEQ_SET,HIDDEN_SET),
 #           clr_train="purple", clr_test="red")
 save_plot("SVR_Stack", train_meta[:, -1], stack_pred_scaled,
           clr_train="purple", clr_test="red")
-
-# Combined plot with all models
-plt.figure(figsize=(12,6))
-plt.plot(df["Date"].values, df["Price"], label="Actual", color="black")
-for (L,H), (tr_pred, te_pred) in zip(zip(SEQ_SET,HIDDEN_SET), 
-                                     zip(train_meta.T, test_meta.T)):
-    tr_usd = scaler.inverse_transform(tr_pred.reshape(-1,1)).squeeze()
-    te_usd = scaler.inverse_transform(te_pred.reshape(-1,1)).squeeze()
-    plt.plot(df["Date"].iloc[max_L:split_idx], tr_usd,
-             label=f"LSTM{H} (train)", color="blue", linestyle="--")
-    plt.plot(test_dates, te_usd,
-             label=f"LSTM{H} (test)", color="purple", linestyle="--")
-plt.plot(test_dates, scaler.inverse_transform(stack_pred_scaled.reshape(-1,1)).squeeze(),
-         label="SVR Stack (test)", color="red", linestyle="--")
-plt.axvline(x=SPLIT_DATE, color='r', linestyle='--', alpha=0.5)
-plt.title("All models - aligned train & test predictions")
-plt.xlabel("Date"); plt.ylabel("WTI (USD)")
-plt.legend(); plt.tight_layout()
-fn = os.path.join(FIG_DIR, "aligned_all_models.png")
-plt.savefig(fn, dpi=300); plt.close()
-print(f"[PLOT] saved {fn}")
-
