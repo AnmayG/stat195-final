@@ -9,15 +9,15 @@ from sklearn.model_selection import KFold
 from datetime import datetime
 import joblib, random
 import matplotlib.pyplot as plt
+import os
+FIG_DIR = "run_figs"
+os.makedirs(FIG_DIR, exist_ok=True)
 
-# ---------- 0. REPRODUCIBILITY ----------
 SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
-# ---------- 1. LOAD DATA & SCALE ----------
-# The CSV file "wti_daily.csv" should contain at least "Date" and "Price" columns.
 df = pd.read_csv("wti_daily.csv", parse_dates=["Date"]).sort_values("Date")
 prices = df["Price"].values.reshape(-1, 1)
 scaler = MinMaxScaler()
@@ -35,7 +35,7 @@ def make_sequences(series, seq_len):
 X_all, y_all = make_sequences(scaled, SEQ_LEN)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ---------- 2. DEFINE THE BASE LSTM MODEL ----------
+# ---------- DEFINE THE BASE LSTM MODEL ----------
 class PriceLSTM(nn.Module):
     def __init__(self, hidden, layers, drop):
         super().__init__()
@@ -69,7 +69,7 @@ def train_one(net, Xtr, ytr, epochs=60, lr=1e-3, bs=128):
     torch.cuda.empty_cache()
     return net
 
-# ---------- 3. CREATE K‑FOLD OUT‑OF‑FOLD PREDICTIONS for the base learners ----------
+# ---------- CREATE K‑FOLD OUT‑OF‑FOLD PREDICTIONS for the base learners ----------
 FOLDS = 5
 HIDDEN_SET = [32, 64]  # two LSTM variants
 # This matrix will hold each learner's out‑of‑fold (OOF) predictions.
@@ -84,6 +84,7 @@ for m, hidden in enumerate(HIDDEN_SET):
     print(f"\nTraining LSTM base learner #{m+1} (hidden units={hidden})")
     preds_learner = np.zeros(len(X_all))  # store OOF predictions for learner m
     for tr_idx, val_idx in kf.split(X_all):
+        print(f"Fold {len(preds_learner[tr_idx])} -> {len(preds_learner[val_idx])}")
         net = PriceLSTM(hidden, layers=2, drop=0)
         net = train_one(net, X_all[tr_idx], y_all[tr_idx])
         with torch.no_grad():
@@ -92,12 +93,12 @@ for m, hidden in enumerate(HIDDEN_SET):
         oof_meta[val_idx, m] = preds
     predictions_per_learner[m] = preds_learner
 
-# ---------- 4. TRAIN THE SVR META LEARNER ----------
+# ---------- TRAIN THE SVR META LEARNER ----------
 # SVR hyperparameters (RBF kernel) as per the paper's description :contentReference[oaicite:0]{index=0}.
 meta = SVR(kernel="rbf", C=10, gamma="scale", epsilon=0.001)
 meta.fit(oof_meta, y_all.ravel())  # note: y_all is still scaled
 
-# ---------- 5. SPLIT THE DATA INTO TRAIN/TEST (Chronological) ----------
+# ---------- SPLIT THE DATA INTO TRAIN/TEST (Chronological) ----------
 # Training: from beginning until 4 Aug 2017; Test: remaining data.
 split_date = datetime(2017, 8, 4)
 # Find the split index adjusting for the sequence length.
@@ -108,14 +109,25 @@ y_train, y_test = y_all[:split_idx], y_all[split_idx:]
 # Refit base learners on the full training set and predict on the test set.
 test_meta = np.zeros((len(X_test), len(HIDDEN_SET)))
 pred_test_per_learner = {}  # for plotting test predictions of each base learner
+print("\n=== Base-Learner Test Scores ===")
 for m, hidden in enumerate(HIDDEN_SET):
     print(f"\nRefitting LSTM base learner #{m+1} (hidden units={hidden}) on full training set")
     net = PriceLSTM(hidden, layers=2, drop=0)
     net = train_one(net, X_train, y_train)
     with torch.no_grad():
-        preds_test = net(torch.tensor(X_test, dtype=torch.float32)).numpy().squeeze()
-    test_meta[:, m] = preds_test
-    pred_test_per_learner[m] = preds_test
+        preds_test_scaled = net(torch.tensor(X_test, dtype=torch.float32)).numpy().squeeze()
+    test_meta[:, m] = preds_test_scaled
+    pred_test_per_learner[m] = preds_test_scaled
+    
+    # inverse-scale to the price domain
+    preds_test = scaler.inverse_transform(preds_test_scaled.reshape(-1, 1)).squeeze()
+    truth      = scaler.inverse_transform(y_test).squeeze()
+    
+    # compute metrics
+    mse  = mean_squared_error(truth, preds_test)
+    mape = mean_absolute_percentage_error(truth, preds_test) * 100
+    
+    print(f"LSTM (hidden={hidden:>3})  —  Test MSE: {mse:10.4f}   MAPE: {mape:6.2f}%")
 
 final_pred_scaled = meta.predict(test_meta).reshape(-1, 1)
 final_pred = scaler.inverse_transform(final_pred_scaled)
@@ -125,7 +137,7 @@ mse = mean_squared_error(truth, final_pred)
 mape = mean_absolute_percentage_error(truth, final_pred) * 100
 print(f"\nStacked Model Test MSE: {mse:.4f}   MAPE: {mape:.2f}%")
 
-# ---------- 6. PLOTTING ----------
+# ---------- PLOTTING ----------
 
 # (a) Plot the final stacked learner's fit on the test set.
 test_dates = df["Date"].values[-len(truth):]  # assumes test set corresponds to the last dates
@@ -137,7 +149,10 @@ plt.xlabel("Date")
 plt.ylabel("WTI Price")
 plt.legend()
 plt.tight_layout()
-plt.show()
+fname = os.path.join(FIG_DIR, "stacked_vs_actual_test.png")
+plt.savefig(fname, dpi=300)
+plt.close()
+print(f"Saved {fname}")
 
 # (b) Plot the individual learner's OOF predictions (on the entire dataset).
 for m, hidden in enumerate(HIDDEN_SET):
@@ -153,7 +168,10 @@ for m, hidden in enumerate(HIDDEN_SET):
     plt.ylabel("WTI Price")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    fname = os.path.join(FIG_DIR, f"oof_hidden{hidden}.png")
+    plt.savefig(fname, dpi=300)
+    plt.close()
+    print(f"Saved {fname}")
 
 # (c) Plot the individual learner's predictions on the test set.
 for m, hidden in enumerate(HIDDEN_SET):
@@ -167,5 +185,8 @@ for m, hidden in enumerate(HIDDEN_SET):
     plt.ylabel("WTI Price")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    fname = os.path.join(FIG_DIR, f"test_hidden{hidden}.png")
+    plt.savefig(fname, dpi=300)
+    plt.close()
+    print(f"Saved {fname}")
 
